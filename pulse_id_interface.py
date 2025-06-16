@@ -11,194 +11,355 @@ from dotenv import load_dotenv
 import boto3
 import io
 import json
+import traceback
 
 # Load environment variables
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Initialize OpenAI client with error handling
+try:
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    if not client.api_key:
+        st.error("OpenAI API key not found. Please check your .env file")
+        st.stop()
+except Exception as e:
+    st.error(f"Failed to initialize OpenAI client: {str(e)}")
+    st.stop()
 
 st.set_page_config(page_title="RFM Segmentation Tool", layout="wide")
 st.title("📊 RFM Segmentation with GPT-powered Column Mapping")
 
 # --- Section 1: File Source ---
-st.sidebar.header("📂 Upload or S3")
+st.sidebar.header("📂 Data Source Options")
 source_type = st.sidebar.radio("Choose CSV Source", ["Upload CSV", "S3 Bucket"])
 
 df_raw = None
 
 if source_type == "S3 Bucket":
-    bucket = st.sidebar.text_input("S3 Bucket", value="pulseid-ai")
-    key = st.sidebar.text_input("S3 Key", value="Sagemaker/Visa Japan/transactions/AUTHORIZATION/2025/04_all_cleaned_combined/full_combined.csv")
+    st.sidebar.subheader("S3 Configuration")
+    bucket = st.sidebar.text_input("Bucket Name", value="pulseid-ai")
+    key = st.sidebar.text_input("File Path", value="Sagemaker/Visa Japan/transactions/AUTHORIZATION/2025/04_all_cleaned_combined/full_combined.csv")
+    aws_region = st.sidebar.text_input("AWS Region", value="us-east-1")
     load_button = st.sidebar.button("Load from S3")
 
     if load_button:
         try:
-            s3 = boto3.client('s3')
+            s3 = boto3.client('s3', region_name=aws_region)
             obj = s3.get_object(Bucket=bucket, Key=key)
             df_raw = pd.read_csv(io.BytesIO(obj['Body'].read()), nrows=5000)
-            st.success("Loaded preview from S3")
+            st.success(f"Successfully loaded {len(df_raw)} records from S3")
         except Exception as e:
-            st.error(f"Failed to load S3: {e}")
+            st.error(f"Failed to load from S3: {str(e)}")
+            st.error(traceback.format_exc())
             st.stop()
 else:
-    uploaded_file = st.sidebar.file_uploader("Upload your CSV file", type="csv")
+    uploaded_file = st.sidebar.file_uploader("Upload CSV File", type="csv")
     if uploaded_file is not None:
-        df_raw = pd.read_csv(uploaded_file)
-        st.success("CSV file uploaded successfully")
+        try:
+            df_raw = pd.read_csv(uploaded_file)
+            st.success(f"Successfully loaded {len(df_raw)} records from uploaded file")
+        except Exception as e:
+            st.error(f"Failed to read uploaded file: {str(e)}")
+            st.stop()
 
 if df_raw is None:
-    st.warning("Please upload a file or load from S3 to proceed")
+    st.info("Please upload a file or connect to S3 to begin")
     st.stop()
 
+# Display raw data preview
+with st.expander("🔍 Raw Data Preview"):
+    st.dataframe(df_raw.head())
+
 # --- Section 2: GPT Column Mapping ---
+st.header("🔑 Column Mapping")
+
 def map_columns_with_gpt(column_names):
     prompt = f"""
-You are a data analyst. The user uploaded a dataset with the following columns:
+You are a data analyst helping with RFM segmentation. The dataset has these columns:
 {column_names}
 
-Your task is to check if the dataset contains or can be mapped to the required columns for RFM segmentation:
-1. external_user_id or user_id
-2. transaction_date
-3. transaction_amount or Monetary
+Identify which columns should map to these RFM components:
+1. user_id (customer identifier)
+2. transaction_date (date of transaction)
+3. Monetary (transaction amount)
 
-If the columns are available or can be mapped, return the mapping as a JSON dict:
-{{"user_id": "external_user_id", "transaction_date": "transactionDate", "Monetary": "amount"}}
+Return ONLY this JSON structure with the actual column names:
 
-If not enough columns are available, respond with:
-{{"error": "Provided columns are not enough"}}
+{{
+    "user_id": "column_name",
+    "transaction_date": "column_name", 
+    "Monetary": "column_name",
+    "confidence": "high/medium/low"
+}}
+
+If unclear, set "confidence": "low" and we'll use manual mapping.
 """
-
+    
     try:
         response = client.chat.completions.create(
             model="gpt-4",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0
+            temperature=0.3,
+            response_format={"type": "json_object"}
         )
         return response.choices[0].message.content
     except Exception as e:
         return json.dumps({"error": f"GPT API error: {str(e)}"})
 
-mapping_result = map_columns_with_gpt(df_raw.columns.tolist())
+# Run GPT mapping when requested
+if st.button("🤖 Auto-map Columns with GPT"):
+    with st.spinner("Consulting GPT for column mapping..."):
+        mapping_result = map_columns_with_gpt(df_raw.columns.tolist())
+        
+        try:
+            column_map = json.loads(mapping_result)
+            
+            if "error" in column_map:
+                st.error(column_map["error"])
+            else:
+                st.session_state.column_map = column_map
+                st.success("GPT-generated mapping:")
+                st.json(column_map)
+                
+                if column_map.get("confidence", "low") == "low":
+                    st.warning("GPT has low confidence in this mapping. Please verify.")
+                
+        except json.JSONDecodeError:
+            st.error("GPT returned invalid JSON. Response was:")
+            st.code(mapping_result)
+        except Exception as e:
+            st.error(f"Mapping error: {str(e)}")
 
-try:
-    column_map = json.loads(mapping_result)
-    if "error" in column_map:
-        st.error(column_map["error"])
-        st.stop()
-except Exception as e:
-    st.error(f"Failed to parse GPT mapping response: {str(e)}")
-    st.stop()
+# Manual mapping fallback
+st.subheader("Manual Column Mapping")
+if 'column_map' not in st.session_state:
+    st.session_state.column_map = {
+        "user_id": "",
+        "transaction_date": "",
+        "Monetary": ""
+    }
 
-# Verify all required columns exist in the dataframe
-required_columns = ['user_id', 'transaction_date', 'Monetary']
-for col in required_columns:
-    if col not in column_map:
-        st.error(f"Required column mapping missing: {col}")
-        st.stop()
-    if column_map[col] not in df_raw.columns:
-        st.error(f"Mapped column '{column_map[col]}' not found in dataframe")
-        st.stop()
+# Create manual mapping interface
+col1, col2, col3 = st.columns(3)
+with col1:
+    st.session_state.column_map["user_id"] = st.selectbox(
+        "User/Customer ID Column",
+        options=df_raw.columns,
+        index=df_raw.columns.get_loc(st.session_state.column_map["user_id"]) 
+        if st.session_state.column_map["user_id"] in df_raw.columns else 0
+    )
+with col2:
+    st.session_state.column_map["transaction_date"] = st.selectbox(
+        "Transaction Date Column",
+        options=df_raw.columns,
+        index=df_raw.columns.get_loc(st.session_state.column_map["transaction_date"])
+        if st.session_state.column_map["transaction_date"] in df_raw.columns else 0
+    )
+with col3:
+    st.session_state.column_map["Monetary"] = st.selectbox(
+        "Transaction Amount Column",
+        options=df_raw.columns,
+        index=df_raw.columns.get_loc(st.session_state.column_map["Monetary"])
+        if st.session_state.column_map["Monetary"] in df_raw.columns else 0
+    )
 
 # --- Section 3: RFM Calculation ---
-st.subheader("Preview of Cleaned Data")
+st.header("📊 RFM Calculation")
+
+# Validate mapping before proceeding
+missing_mappings = [k for k, v in st.session_state.column_map.items() if not v]
+if missing_mappings:
+    st.error(f"Please complete column mapping for: {', '.join(missing_mappings)}")
+    st.stop()
 
 try:
+    # Prepare data with selected columns
     df_clean = df_raw.rename(columns={
-        column_map['user_id']: 'user_id',
-        column_map['transaction_date']: 'transaction_date',
-        column_map['Monetary']: 'Monetary'
+        st.session_state.column_map['user_id']: 'user_id',
+        st.session_state.column_map['transaction_date']: 'transaction_date',
+        st.session_state.column_map['Monetary']: 'Monetary'
     }).copy()
     
-    # Clean & convert
+    # Data cleaning
     rfm_df = df_clean[['user_id', 'transaction_date', 'Monetary']].copy()
     rfm_df['transaction_date'] = pd.to_datetime(rfm_df['transaction_date'], errors='coerce')
     rfm_df['Monetary'] = pd.to_numeric(rfm_df['Monetary'], errors='coerce')
-    rfm_df.dropna(subset=['transaction_date', 'Monetary'], inplace=True)
     
-    if rfm_df.empty:
+    # Remove rows with invalid dates/amounts
+    initial_count = len(rfm_df)
+    rfm_df.dropna(subset=['transaction_date', 'Monetary'], inplace=True)
+    final_count = len(rfm_df)
+    
+    if final_count == 0:
         st.error("No valid data remaining after cleaning")
         st.stop()
+        
+    if initial_count != final_count:
+        st.warning(f"Removed {initial_count - final_count} rows with invalid data ({final_count} remaining)")
 
-    # Get current date
+    # Calculate RFM metrics
     current_date = datetime.now().date()
-
-    # Group and calculate RFM
+    
     rfm = rfm_df.groupby('user_id').agg(
         Frequency=('user_id', 'count'),
         Monetary=('Monetary', 'sum'),
         Recency=('transaction_date', lambda x: (current_date - x.max().date()).days)
     ).reset_index()
     
-    st.dataframe(rfm.head())
-
+    # Display results
+    st.success(f"RFM metrics calculated for {len(rfm)} customers")
+    with st.expander("View RFM Data"):
+        st.dataframe(rfm.head())
+    
+    # Calculate percentiles for RFM scores
+    rfm['R_Score'] = pd.qcut(rfm['Recency'], q=5, labels=[5,4,3,2,1]).astype(int)
+    rfm['F_Score'] = pd.qcut(rfm['Frequency'], q=5, labels=[1,2,3,4,5]).astype(int)
+    rfm['M_Score'] = pd.qcut(rfm['Monetary'], q=5, labels=[1,2,3,4,5]).astype(int)
+    rfm['RFM_Score'] = rfm['R_Score'].astype(str) + rfm['F_Score'].astype(str) + rfm['M_Score'].astype(str)
+    
 except Exception as e:
     st.error(f"Error during RFM calculation: {str(e)}")
+    st.error(traceback.format_exc())
     st.stop()
 
-# --- Section 4: Elbow Curve ---
-st.subheader("📈 Elbow Curve for Optimal k")
+# --- Section 4: Clustering ---
+st.header("🧮 Customer Segmentation")
 
-try:
-    scaler = StandardScaler()
-    rfm_scaled = scaler.fit_transform(rfm[['Recency', 'Frequency', 'Monetary']])
+# Elbow Method
+st.subheader("Optimal Number of Clusters")
+scaler = StandardScaler()
+rfm_scaled = scaler.fit_transform(rfm[['Recency', 'Frequency', 'Monetary']])
 
-    sse = []
-    K = range(1, 11)
-    for k in K:
-        kmeans = KMeans(n_clusters=k, random_state=42)
-        kmeans.fit(rfm_scaled)
-        sse.append(kmeans.inertia_)
+sse = []
+K = range(1, 11)
+for k in K:
+    kmeans = KMeans(n_clusters=k, random_state=42)
+    kmeans.fit(rfm_scaled)
+    sse.append(kmeans.inertia_)
 
-    fig = px.line(x=list(K), y=sse, markers=True, 
-                 labels={'x': 'k (Number of Clusters)', 'y': 'SSE'}, 
-                 title='Elbow Curve')
-    st.plotly_chart(fig)
+fig = px.line(x=list(K), y=sse, markers=True,
+             labels={'x': 'Number of Clusters', 'y': 'Sum of Squared Errors'},
+             title='Elbow Method for Optimal k')
+st.plotly_chart(fig, use_container_width=True)
 
-except Exception as e:
-    st.error(f"Error creating elbow curve: {str(e)}")
-    st.stop()
+# Cluster selection
+k_value = st.slider("Select number of clusters", min_value=2, max_value=10, value=4)
 
-k_value = st.number_input("Select number of clusters (k)", min_value=2, max_value=10, value=3)
+# Apply clustering
+kmeans = KMeans(n_clusters=k_value, random_state=42)
+rfm['Cluster'] = kmeans.fit_predict(rfm_scaled)
 
-# --- Section 5: Final Clustering ---
-try:
-    kmeans = KMeans(n_clusters=k_value, random_state=42)
-    rfm['Cluster'] = kmeans.fit_predict(rfm_scaled)
-except Exception as e:
-    st.error(f"Error during clustering: {str(e)}")
-    st.stop()
+# Visualize clusters
+fig = px.scatter_3d(rfm, x='Recency', y='Frequency', z='Monetary',
+                   color='Cluster', hover_name='user_id',
+                   title='3D Cluster Visualization')
+st.plotly_chart(fig, use_container_width=True)
 
-# --- Section 6: Cluster Overview ---
-st.subheader("🧮 Cluster Summary")
+# --- Section 5: Cluster Analysis ---
+st.header("📈 Cluster Analysis")
 
-try:
-    for cluster_id in sorted(rfm['Cluster'].unique()):
-        cluster_data = rfm[rfm['Cluster'] == cluster_id]
-        st.markdown(f"### 🧊 Cluster {cluster_id} - ({len(cluster_data)} users)")
-        st.dataframe(cluster_data.describe())
-except Exception as e:
-    st.error(f"Error displaying cluster summaries: {str(e)}")
+# Cluster summaries
+for cluster_id in sorted(rfm['Cluster'].unique()):
+    cluster_data = rfm[rfm['Cluster'] == cluster_id]
+    
+    with st.expander(f"Cluster {cluster_id} - {len(cluster_data)} customers"):
+        st.write(f"**Avg Recency:** {cluster_data['Recency'].mean():.1f} days")
+        st.write(f"**Avg Frequency:** {cluster_data['Frequency'].mean():.1f} transactions")
+        st.write(f"**Avg Monetary Value:** ${cluster_data['Monetary'].mean():,.2f}")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.dataframe(cluster_data.describe())
+        with col2:
+            fig = px.box(cluster_data, y=['Recency', 'Frequency', 'Monetary'])
+            st.plotly_chart(fig, use_container_width=True)
 
-# --- Section 7: Generate Cluster Names using GPT ---
-if st.button("🔍 Generate Meaningful Cluster Names with GPT"):
-    try:
-        cluster_insights = ""
-        for cluster_id in sorted(rfm['Cluster'].unique()):
-            cluster_data = rfm[rfm['Cluster'] == cluster_id][['Recency', 'Frequency', 'Monetary']]
-            cluster_insights += f"\nCluster {cluster_id} Summary:\n"
-            cluster_insights += str(cluster_data.describe()) + "\n"
+# --- Section 6: GPT Cluster Naming ---
+st.header("🏷️ Cluster Naming")
 
-        cluster_prompt = f"""
-You are an expert in customer segmentation. Based on the following cluster summaries from RFM segmentation, assign meaningful business labels (like "High Value", "At Risk", "New Customers", etc.) to each cluster.
-{cluster_insights}
+if st.button("✨ Generate Cluster Names with GPT"):
+    with st.spinner("Generating meaningful cluster names..."):
+        try:
+            # Prepare cluster summaries
+            cluster_summaries = []
+            for cluster_id in sorted(rfm['Cluster'].unique()):
+                cluster_data = rfm[rfm['Cluster'] == cluster_id]
+                summary = {
+                    "cluster": cluster_id,
+                    "size": len(cluster_data),
+                    "recency_mean": cluster_data['Recency'].mean(),
+                    "frequency_mean": cluster_data['Frequency'].mean(),
+                    "monetary_mean": cluster_data['Monetary'].mean(),
+                    "top_rfm_scores": cluster_data['RFM_Score'].value_counts().head(3).to_dict()
+                }
+                cluster_summaries.append(summary)
+            
+            prompt = f"""
+Analyze these customer clusters for RFM segmentation:
+{json.dumps(cluster_summaries, indent=2)}
 
-Return as JSON: {{ "Cluster 0": "label0", "Cluster 1": "label1", ... }}
+For each cluster, suggest:
+1. A short descriptive name (e.g., "High Value Loyalists")
+2. Key characteristics
+3. Recommended engagement strategy
+
+Return ONLY JSON in this format:
+{{
+    "clusters": [
+        {{
+            "id": 0,
+            "name": "Cluster Name",
+            "characteristics": "Key traits",
+            "strategy": "Recommended actions"
+        }}
+    ]
+}}
 """
+            response = client.chat.completions.create(
+                model="gpt-4",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                response_format={"type": "json_object"}
+            )
+            
+            cluster_names = json.loads(response.choices[0].message.content)
+            st.session_state.cluster_names = cluster_names
+            st.success("Generated cluster names:")
+            st.json(cluster_names)
+            
+            # Apply names to dataframe
+            name_mapping = {c['id']: c['name'] for c in cluster_names['clusters']}
+            rfm['Cluster_Name'] = rfm['Cluster'].map(name_mapping)
+            
+        except Exception as e:
+            st.error(f"Failed to generate cluster names: {str(e)}")
 
-        response = client.chat.completions.create(
-            model="gpt-4",
-            messages=[{"role": "user", "content": cluster_prompt}],
-            temperature=0
-        )
-        st.code(response.choices[0].message.content)
-    except Exception as e:
-        st.error(f"Error generating cluster names: {str(e)}")
+# Display final results
+if 'cluster_names' in st.session_state:
+    st.subheader("Final Segmentation Results")
+    st.dataframe(rfm.sort_values('Monetary', ascending=False))
+    
+    # Export options
+    st.download_button(
+        label="📥 Download Results as CSV",
+        data=rfm.to_csv(index=False),
+        file_name="rfm_segmentation.csv",
+        mime="text/csv"
+    )
+
+# --- Section 7: Help/Instructions ---
+with st.expander("ℹ️ How to use this tool"):
+    st.markdown("""
+    **RFM Segmentation Guide**
+    
+    1. **Upload Data**: Provide your transaction data via CSV upload or S3
+    2. **Column Mapping**: Automatically map columns with GPT or manually select them
+    3. **RFM Calculation**: The tool will calculate Recency, Frequency, Monetary values
+    4. **Clustering**: Determine optimal clusters and visualize results
+    5. **Analysis**: Review cluster characteristics and get AI-generated names
+    
+    **Key Concepts**:
+    - **Recency**: How recently a customer purchased (lower = better)
+    - **Frequency**: How often they purchase (higher = better)
+    - **Monetary**: How much they spend (higher = better)
+    """)
