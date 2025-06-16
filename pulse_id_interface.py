@@ -1,140 +1,159 @@
 import streamlit as st
 import pandas as pd
-import openai
-import boto3
-from io import StringIO
+import plotly.express as px
+import numpy as np
 from datetime import datetime
-import plotly.graph_objs as go
-from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from openai import OpenAI
+import os
+from dotenv import load_dotenv
+import boto3
+import io
+import json
 
-# --- OpenAI API Setup ---
-openai.api_key = st.secrets.get("OPENAI_API_KEY")
+# Load environment variables
+load_dotenv()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# --- Streamlit UI ---
-st.title("🧠 RFM Segmentation with LLM & Clustering")
+st.set_page_config(page_title="RFM Segmentation Tool", layout="wide")
+st.title("📊 RFM Segmentation with GPT-powered Column Mapping")
 
-# --- Data Source Selection ---
-data_source = st.radio("Choose Data Source", ["Upload CSV", "Fetch from S3"])
+# --- Section 1: File Source ---
+st.sidebar.header("📂 Upload or S3")
+source_type = st.sidebar.radio("Choose CSV Source", ["Upload CSV", "S3 Bucket"])
 
-if data_source == "Upload CSV":
-    uploaded_file = st.file_uploader("Upload your CSV", type=["csv"])
-    if uploaded_file:
+if source_type == "S3 Bucket":
+    bucket = st.sidebar.text_input("S3 Bucket", value="pulseid-ai")
+    key = st.sidebar.text_input("S3 Key", value="Sagemaker/Visa Japan/transactions/AUTHORIZATION/2025/04_all_cleaned_combined/full_combined.csv")
+    load_button = st.sidebar.button("Load from S3")
+
+    if load_button:
+        try:
+            s3 = boto3.client('s3')
+            obj = s3.get_object(Bucket=bucket, Key=key)
+            df_raw = pd.read_csv(io.BytesIO(obj['Body'].read()), nrows=5000)
+            st.success("Loaded preview from S3")
+        except Exception as e:
+            st.error(f"Failed to load S3: {e}")
+            st.stop()
+else:
+    uploaded_file = st.sidebar.file_uploader("Upload your CSV file", type="csv")
+    if uploaded_file is not None:
         df_raw = pd.read_csv(uploaded_file)
-elif data_source == "Fetch from S3":
-    bucket = 'pulseid-ai'
-    key = 'Sagemaker/Visa Japan/transactions/AUTHORIZATION/2025/04_all_cleaned_combined/full_combined.csv'
-    s3 = boto3.client('s3')
-    obj = s3.get_object(Bucket=bucket, Key=key)
-    df_raw = pd.read_csv(obj['Body'])
+        st.success("CSV file uploaded successfully")
+    else:
+        st.stop()
 
-# --- Step 1: Column Mapping via GPT ---
-def map_columns_with_gpt(columns):
+# --- Section 2: GPT Column Mapping ---
+def map_columns_with_gpt(column_names):
     prompt = f"""
-    These are the columns in the uploaded dataset: {columns}
+You are a data analyst. The user uploaded a dataset with the following columns:
+{column_names}
 
-    Please check if we can calculate Recency, Frequency, and Monetary (RFM) values.
-    - Recency needs a user_id and a transaction date.
-    - Frequency needs a user_id.
-    - Monetary needs a user_id and amount.
+Your task is to check if the dataset contains or can be mapped to the required columns for RFM segmentation:
+1. external_user_id or user_id
+2. transaction_date
+3. transaction_amount or Monetary
 
-    If possible, map the uploaded columns to the expected ones:
-    - user_id => external_user_id
-    - txn_date => transactionDate
-    - amount_spent => Monetary
+If the columns are available or can be mapped, return the mapping as a JSON dict:
+{{"user_id": "external_user_id", "transaction_date": "transactionDate", "Monetary": "amount"}}
 
-    Respond in JSON format like:
-    {{
-      "can_calculate_rfm": true,
-      "mapped_columns": {{
-        "external_user_id": "user_id",
-        "transactionDate": "txn_date",
-        "Monetary": "amount_spent"
-      }}
-    }}
-    """
-    response = openai.ChatCompletion.create(
+If not enough columns are available, respond with:
+{{"error": "Provided columns are not enough"}}
+"""
+
+    response = client.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
         temperature=0
     )
-    return eval(response.choices[0].message.content)
+    return response.choices[0].message.content
 
-if 'df_raw' in locals():
-    mapping_result = map_columns_with_gpt(df_raw.columns.tolist())
+mapping_result = map_columns_with_gpt(df_raw.columns.tolist())
 
-    if not mapping_result.get("can_calculate_rfm"):
-        st.error("❌ Provided columns are not sufficient for RFM analysis.")
+try:
+    column_map = json.loads(mapping_result)
+    if "error" in column_map:
+        st.error(column_map["error"])
         st.stop()
-    else:
-        col_map = mapping_result["mapped_columns"]
-        df_raw.rename(columns=col_map, inplace=True)
-        st.success("✅ Required columns mapped successfully!")
-        st.dataframe(df_raw.head())
+except Exception:
+    st.error("Failed to parse GPT mapping response")
+    st.stop()
 
-        # --- Date Input ---
-        input_date = st.date_input("Select Current Date", value=datetime.today())
+# --- Section 3: RFM Calculation ---
+st.subheader("Preview of Cleaned Data")
+df_raw.rename(columns={
+    column_map['user_id']: 'user_id',
+    column_map['transaction_date']: 'transaction_date',
+    column_map['Monetary']: 'Monetary'
+}, inplace=True)
 
-        # --- RFM Calculation ---
-        df_raw['transactionDate'] = pd.to_datetime(df_raw['transactionDate'].astype(str).str.split(' ').str[0], errors='coerce')
-        df_raw['Monetary'] = pd.to_numeric(df_raw['Monetary'], errors='coerce')
-        df_raw = df_raw.dropna(subset=['transactionDate', 'Monetary'])
+# Clean & convert
+rfm_df = df_raw[['user_id', 'transaction_date', 'Monetary']].copy()
+rfm_df['transaction_date'] = pd.to_datetime(rfm_df['transaction_date'], errors='coerce')
+rfm_df['Monetary'] = pd.to_numeric(rfm_df['Monetary'], errors='coerce')
+rfm_df.dropna(subset=['transaction_date', 'Monetary'], inplace=True)
 
-        grouped = df_raw.groupby('external_user_id').agg(
-            Frequency=('external_user_id', 'count'),
-            Monetary=('Monetary', 'sum'),
-            Recency=('transactionDate', 'max')
-        ).reset_index()
+# Get current date
+current_date = datetime.now().date()
 
-        grouped['Recency'] = (input_date - grouped['Recency'].dt.date).dt.days
+# Group and calculate RFM
+rfm = rfm_df.groupby('user_id').agg(
+    Frequency=('user_id', 'count'),
+    Monetary=('Monetary', 'sum'),
+    Recency=('transaction_date', 'max')
+).reset_index()
+rfm['Recency'] = (current_date - rfm['Recency'].dt.date).dt.days
+st.dataframe(rfm.head())
 
-        # --- Elbow Method ---
-        scaler = StandardScaler()
-        scaled_rfm = scaler.fit_transform(grouped[['Recency', 'Frequency', 'Monetary']])
-        sse = []
-        for k in range(1, 11):
-            kmeans = KMeans(n_clusters=k, random_state=42).fit(scaled_rfm)
-            sse.append(kmeans.inertia_)
+# --- Section 4: Elbow Curve ---
+st.subheader("📈 Elbow Curve for Optimal k")
+scaler = StandardScaler()
+rfm_scaled = scaler.fit_transform(rfm[['Recency', 'Frequency', 'Monetary']])
 
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=list(range(1, 11)), y=sse, mode='lines+markers'))
-        fig.update_layout(title="Elbow Curve for Optimal k", xaxis_title="k", yaxis_title="SSE")
-        st.plotly_chart(fig)
+sse = []
+K = range(1, 11)
+for k in K:
+    kmeans = KMeans(n_clusters=k, random_state=42)
+    kmeans.fit(rfm_scaled)
+    sse.append(kmeans.inertia_)
 
-        # --- Select k ---
-        k_selected = st.slider("Select number of clusters (k)", 2, 10, value=5)
-        kmeans_final = KMeans(n_clusters=k_selected, random_state=42)
-        grouped['Cluster'] = kmeans_final.fit_predict(scaled_rfm)
+fig = px.line(x=list(K), y=sse, markers=True, labels={'x': 'k (Number of Clusters)', 'y': 'SSE'}, title='Elbow Curve')
+st.plotly_chart(fig)
 
-        # --- Cluster Summaries ---
-        st.subheader("📊 Cluster Summary")
-        for i in range(k_selected):
-            cluster_i = grouped[grouped['Cluster'] == i]
-            st.metric(label=f"Cluster {i}", value=f"{cluster_i.shape[0]} users")
+k_value = st.number_input("Select number of clusters (k)", min_value=2, max_value=10, value=3)
 
-        # --- Cluster Naming Button ---
-        if st.button("🧠 Generate Meaningful Cluster Names"):
-            cluster_names = {}
-            for i in range(k_selected):
-                cluster = grouped[grouped['Cluster'] == i][['Recency', 'Frequency', 'Monetary']]
-                stats = cluster.describe().to_dict()
-                prompt = f"""
-                For cluster {i}, here are the stats:
-                - Avg Recency: {stats['Recency']['mean']:.1f}
-                - Avg Frequency: {stats['Frequency']['mean']:.1f}
-                - Avg Monetary: {stats['Monetary']['mean']:.1f}
-                Suggest a short business-friendly name.
-                """
-                response = openai.ChatCompletion.create(
-                    model="gpt-4o",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.5
-                )
-                cluster_names[f"Cluster {i}"] = response.choices[0].message.content.strip()
+# --- Section 5: Final Clustering ---
+kmeans = KMeans(n_clusters=k_value, random_state=42)
+rfm['Cluster'] = kmeans.fit_predict(rfm_scaled)
 
-            st.write("### 🏷️ Cluster Labels")
-            st.json(cluster_names)
+# --- Section 6: Cluster Overview ---
+st.subheader("🧮 Cluster Summary")
 
-        # --- Show Final DataFrame ---
-        st.subheader("🧾 Final RFM with Clusters")
-        st.dataframe(grouped.head())
+for cluster_id in sorted(rfm['Cluster'].unique()):
+    cluster_data = rfm[rfm['Cluster'] == cluster_id]
+    st.markdown(f"### 🧊 Cluster {cluster_id} - ({len(cluster_data)} users)")
+    st.dataframe(cluster_data.describe())
+
+# --- Section 7: Generate Cluster Names using GPT ---
+if st.button("🔍 Generate Meaningful Cluster Names with GPT"):
+    cluster_insights = ""
+    for cluster_id in sorted(rfm['Cluster'].unique()):
+        cluster_data = rfm[rfm['Cluster'] == cluster_id][['Recency', 'Frequency', 'Monetary']]
+        cluster_insights += f"\nCluster {cluster_id} Summary:\n"
+        cluster_insights += str(cluster_data.describe()) + "\n"
+
+    cluster_prompt = f"""
+You are an expert in customer segmentation. Based on the following cluster summaries from RFM segmentation, assign meaningful business labels (like "High Value", "At Risk", "New Customers", etc.) to each cluster.
+{cluster_insights}
+
+Return as JSON: {{ "Cluster 0": "label0", "Cluster 1": "label1", ... }}
+"""
+
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": cluster_prompt}],
+        temperature=0
+    )
+    st.code(response.choices[0].message.content)
