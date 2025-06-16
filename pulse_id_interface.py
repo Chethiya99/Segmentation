@@ -74,8 +74,7 @@ with st.expander("🔍 Raw Data Preview"):
 st.header("🔑 Column Mapping")
 
 def map_columns_with_gpt(column_names):
-    prompt = f"""
-You are a data analyst helping with RFM segmentation. The dataset has these columns:
+    prompt = f"""You are a data analyst helping with RFM segmentation. The dataset has these columns:
 {column_names}
 
 Identify which columns should map to these RFM components:
@@ -83,7 +82,7 @@ Identify which columns should map to these RFM components:
 2. transaction_date (date of transaction)
 3. Monetary (transaction amount)
 
-Return ONLY this JSON structure with the actual column names:
+Return ONLY a valid JSON object with the following structure using the actual column names:
 
 {{
     "user_id": "column_name",
@@ -92,17 +91,22 @@ Return ONLY this JSON structure with the actual column names:
     "confidence": "high/medium/low"
 }}
 
-If unclear, set "confidence": "low" and we'll use manual mapping.
-"""
+Important:
+- The response must contain ONLY the JSON object
+- If unclear about any mapping, set "confidence": "low"
+- Do not include any additional text or explanation"""
     
     try:
         response = client.chat.completions.create(
             model="gpt-4",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            response_format={"type": "json_object"}
+            temperature=0.3
         )
-        return response.choices[0].message.content
+        # Extract and validate JSON from response
+        response_content = response.choices[0].message.content
+        if response_content.startswith("```json"):
+            response_content = response_content[7:-3]  # Remove markdown json tags if present
+        return response_content.strip()
     except Exception as e:
         return json.dumps({"error": f"GPT API error: {str(e)}"})
 
@@ -125,7 +129,7 @@ if st.button("🤖 Auto-map Columns with GPT"):
                     st.warning("GPT has low confidence in this mapping. Please verify.")
                 
         except json.JSONDecodeError:
-            st.error("GPT returned invalid JSON. Response was:")
+            st.error("Failed to parse GPT response as JSON. Response was:")
             st.code(mapping_result)
         except Exception as e:
             st.error(f"Mapping error: {str(e)}")
@@ -311,8 +315,7 @@ if st.button("✨ Generate Cluster Names with GPT"):
                 }
                 cluster_summaries.append(summary)
             
-            prompt = f"""
-Analyze these customer clusters for RFM segmentation:
+            prompt = f"""Analyze these customer clusters for RFM segmentation:
 {json.dumps(cluster_summaries, indent=2)}
 
 For each cluster, suggest:
@@ -320,7 +323,7 @@ For each cluster, suggest:
 2. Key characteristics
 3. Recommended engagement strategy
 
-Return ONLY JSON in this format:
+Return ONLY a valid JSON object in this format:
 {{
     "clusters": [
         {{
@@ -331,15 +334,23 @@ Return ONLY JSON in this format:
         }}
     ]
 }}
-"""
+
+Important:
+- The response must contain ONLY the JSON object
+- Do not include any additional text or explanation"""
+            
             response = client.chat.completions.create(
                 model="gpt-4",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                response_format={"type": "json_object"}
+                temperature=0.3
             )
             
-            cluster_names = json.loads(response.choices[0].message.content)
+            # Extract and validate JSON from response
+            response_content = response.choices[0].message.content
+            if response_content.startswith("```json"):
+                response_content = response_content[7:-3]  # Remove markdown json tags if present
+            
+            cluster_names = json.loads(response_content.strip())
             st.session_state.cluster_names = cluster_names
             st.success("Generated cluster names:")
             st.json(cluster_names)
@@ -350,6 +361,7 @@ Return ONLY JSON in this format:
             
         except Exception as e:
             st.error(f"Failed to generate cluster names: {str(e)}")
+            st.error(traceback.format_exc())
 
 # Display final results
 if 'cluster_names' in st.session_state:
