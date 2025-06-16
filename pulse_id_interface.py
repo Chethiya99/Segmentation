@@ -166,12 +166,6 @@ with col3:
 # --- Section 3: RFM Calculation ---
 st.header("📊 RFM Calculation")
 
-# Validate mapping before proceeding
-missing_mappings = [k for k, v in st.session_state.column_map.items() if not v]
-if missing_mappings:
-    st.error(f"Please complete column mapping for: {', '.join(missing_mappings)}")
-    st.stop()
-
 try:
     # Prepare data with selected columns
     df_clean = df_raw.rename(columns={
@@ -211,10 +205,33 @@ try:
     with st.expander("View RFM Data"):
         st.dataframe(rfm.head())
     
-    # Calculate percentiles for RFM scores
-    rfm['R_Score'] = pd.qcut(rfm['Recency'], q=5, labels=[5,4,3,2,1]).astype(int)
-    rfm['F_Score'] = pd.qcut(rfm['Frequency'], q=5, labels=[1,2,3,4,5]).astype(int)
-    rfm['M_Score'] = pd.qcut(rfm['Monetary'], q=5, labels=[1,2,3,4,5]).astype(int)
+    # Calculate percentiles for RFM scores with duplicate handling
+    try:
+        rfm['R_Score'] = pd.qcut(rfm['Recency'], q=5, labels=[5,4,3,2,1], duplicates='drop').astype(int)
+    except ValueError as e:
+        st.warning(f"Recency scoring adjustment needed: {str(e)}")
+        rfm['R_Score'] = pd.cut(rfm['Recency'], bins=5, labels=[5,4,3,2,1]).astype(int)
+    
+    try:
+        rfm['F_Score'] = pd.qcut(rfm['Frequency'], q=5, labels=[1,2,3,4,5], duplicates='drop').astype(int)
+    except ValueError as e:
+        st.warning(f"Frequency scoring adjustment needed: {str(e)}")
+        # Alternative approach when quintiles fail
+        unique_freq = rfm['Frequency'].nunique()
+        if unique_freq < 5:
+            st.warning(f"Only {unique_freq} unique frequency values - using simpler binning")
+            bins = [-1, 1, 2, 3, 5, float('inf')]
+            labels = [1,2,3,4,5][:len(bins)-1]
+            rfm['F_Score'] = pd.cut(rfm['Frequency'], bins=bins, labels=labels).astype(int)
+        else:
+            rfm['F_Score'] = pd.cut(rfm['Frequency'], bins=5, labels=[1,2,3,4,5]).astype(int)
+    
+    try:
+        rfm['M_Score'] = pd.qcut(rfm['Monetary'], q=5, labels=[1,2,3,4,5], duplicates='drop').astype(int)
+    except ValueError as e:
+        st.warning(f"Monetary scoring adjustment needed: {str(e)}")
+        rfm['M_Score'] = pd.cut(rfm['Monetary'], bins=5, labels=[1,2,3,4,5]).astype(int)
+    
     rfm['RFM_Score'] = rfm['R_Score'].astype(str) + rfm['F_Score'].astype(str) + rfm['M_Score'].astype(str)
     
 except Exception as e:
