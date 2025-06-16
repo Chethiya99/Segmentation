@@ -13,6 +13,17 @@ import io
 import json
 import traceback
 
+# Custom JSON encoder to handle numpy types
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, (np.int32, np.int64)):
+            return int(obj)
+        elif isinstance(obj, (np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super().default(obj)
+
 # Load environment variables
 load_dotenv()
 
@@ -301,22 +312,25 @@ st.header("🏷️ Cluster Naming")
 if st.button("✨ Generate Cluster Names with GPT"):
     with st.spinner("Generating meaningful cluster names..."):
         try:
-            # Prepare cluster summaries
+            # Prepare cluster summaries with numpy types converted
             cluster_summaries = []
             for cluster_id in sorted(rfm['Cluster'].unique()):
                 cluster_data = rfm[rfm['Cluster'] == cluster_id]
                 summary = {
-                    "cluster": cluster_id,
-                    "size": len(cluster_data),
-                    "recency_mean": cluster_data['Recency'].mean(),
-                    "frequency_mean": cluster_data['Frequency'].mean(),
-                    "monetary_mean": cluster_data['Monetary'].mean(),
-                    "top_rfm_scores": cluster_data['RFM_Score'].value_counts().head(3).to_dict()
+                    "cluster": int(cluster_id),  # Convert numpy to native Python int
+                    "size": int(len(cluster_data)),
+                    "recency_mean": float(cluster_data['Recency'].mean()),
+                    "frequency_mean": float(cluster_data['Frequency'].mean()),
+                    "monetary_mean": float(cluster_data['Monetary'].mean()),
+                    "top_rfm_scores": {
+                        str(k): int(v) for k, v in 
+                        cluster_data['RFM_Score'].value_counts().head(3).items()
+                    }
                 }
                 cluster_summaries.append(summary)
             
             prompt = f"""Analyze these customer clusters for RFM segmentation:
-{json.dumps(cluster_summaries, indent=2)}
+{json.dumps(cluster_summaries, indent=2, cls=NumpyEncoder)}
 
 For each cluster, suggest:
 1. A short descriptive name (e.g., "High Value Loyalists")
